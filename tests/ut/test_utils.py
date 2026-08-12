@@ -241,6 +241,26 @@ class TestUtils(TestBase):
         self.assertTrue(utils.uses_mooncake_connector({"kv_connector": "MooncakeConnectorV1"}))
         self.assertFalse(utils.uses_mooncake_connector({"kv_connector": "LMCacheConnectorV1"}))
 
+    def test_use_a5_kv_cache_layout_for_heterogeneous_prefill_producer(self):
+        kv_transfer_config = mock.MagicMock(is_kv_producer=True)
+        extra_config = {
+            "enable_heterogeneous_transfer": True,
+            "decode": {"device_type": "A5"},
+        }
+        kv_transfer_config.get_from_extra_config.side_effect = lambda key, default=None: extra_config.get(key, default)
+        vllm_config = mock.MagicMock(kv_transfer_config=kv_transfer_config)
+
+        with mock.patch("vllm_ascend.utils.get_ascend_device_type", return_value=utils.AscendDeviceType.A2):
+            self.assertTrue(utils.use_a5_kv_cache_layout(vllm_config))
+
+    def test_use_a5_kv_cache_layout_rejects_disabled_heterogeneous_transfer(self):
+        kv_transfer_config = mock.MagicMock(is_kv_producer=True)
+        kv_transfer_config.get_from_extra_config.side_effect = lambda key, default=None: default
+        vllm_config = mock.MagicMock(kv_transfer_config=kv_transfer_config)
+
+        with mock.patch("vllm_ascend.utils.get_ascend_device_type", return_value=utils.AscendDeviceType.A2):
+            self.assertFalse(utils.use_a5_kv_cache_layout(vllm_config))
+
     def test_get_max_hidden_layers(self):
         from transformers import PretrainedConfig
 

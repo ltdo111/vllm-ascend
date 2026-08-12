@@ -179,6 +179,39 @@ def is_950():
     return get_ascend_device_type() == AscendDeviceType.A5
 
 
+def _normalize_ascend_device_type(device_type: Any) -> str:
+    if isinstance(device_type, AscendDeviceType):
+        return device_type.name
+    return str(device_type or "").strip().upper().replace("ASCEND", "")
+
+
+def use_a5_kv_cache_layout(vllm_config: VllmConfig | None = None) -> bool:
+    if get_ascend_device_type() == AscendDeviceType.A5:
+        return True
+
+    if vllm_config is None:
+        try:
+            from vllm.config import get_current_vllm_config
+
+            vllm_config = get_current_vllm_config()
+        except Exception:
+            return False
+
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    if kv_transfer_config is None or not getattr(kv_transfer_config, "is_kv_producer", False):
+        return False
+
+    enabled = bool(kv_transfer_config.get_from_extra_config("enable_heterogeneous_transfer", False))
+    enabled = enabled or bool(kv_transfer_config.get_from_extra_config("heterogeneous_transfer", False))
+    if not enabled:
+        return False
+
+    decode_config = kv_transfer_config.get_from_extra_config("decode", {})
+    decode_device_type = decode_config.get("device_type") if isinstance(decode_config, dict) else None
+    decode_device_type = decode_device_type or kv_transfer_config.get_from_extra_config("decode_device_type", "")
+    return _normalize_ascend_device_type(decode_device_type) == "A5"
+
+
 def _mark_op_side_effectful(op: Any) -> None:
     torch.fx.node.has_side_effect(op)
     default_overload = getattr(op, "default", None)

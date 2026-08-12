@@ -83,6 +83,7 @@ from vllm_ascend.utils import (
     extract_dsv4_layer_index,
     get_ascend_device_type,
     get_dsv4_compress_ratio,
+    use_a5_kv_cache_layout,
     vllm_version_is,
 )
 
@@ -97,12 +98,12 @@ def _get_ascend_dsa_backend():
     return AscendDSABackend
 
 
-def _dsv4_block_sizes():
+def _dsv4_block_sizes(vllm_config: VllmConfig | None = None):
     # Lazy import to avoid the circular import chain (layer -> dsa_v1 ->
     # attention_v1 -> device_op) hit during vLLM subprocess model inspection.
-    from vllm_ascend.models.layer.attention.layer import DSV4_BLOCK_SIZES
+    from vllm_ascend.models.layer.attention.layer import get_dsv4_block_sizes
 
-    return DSV4_BLOCK_SIZES
+    return get_dsv4_block_sizes(vllm_config)
 
 
 class AscendCompressorStateCache(CompressorStateCache):
@@ -119,7 +120,7 @@ class AscendCompressorStateCache(CompressorStateCache):
         self.block_size = block_size
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        pads = _dsv4_block_sizes()[vllm_config.cache_config.block_size][1]
+        pads = _dsv4_block_sizes(vllm_config)[vllm_config.cache_config.block_size][1]
         page_size_padded = pads[0] if self.state_dim == 2 * 256 and self.compress_ratio == 4 else pads[1]
 
         return AscendSlidingWindowMLASpec(
@@ -150,14 +151,15 @@ class AscendDeepseekV4IndexerCache(DeepseekV4IndexerCache):
         super().__init__(head_dim, dtype, prefix, cache_config, compress_ratio)
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        if get_ascend_device_type() in {AscendDeviceType.A5}:
+        self.block_size = _dsv4_block_sizes(vllm_config)[vllm_config.cache_config.block_size][0][1]
+        if use_a5_kv_cache_layout(vllm_config):
             self.dtype = torch.float8_e4m3fn
             vllm_config.cache_config.cache_dtype = "float8_e4m3fn"
 
         from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 
         return AscendMLAAttentionSpec(
-            block_size=_dsv4_block_sizes()[vllm_config.cache_config.block_size][0][0],
+            block_size=_dsv4_block_sizes(vllm_config)[vllm_config.cache_config.block_size][0][0],
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
@@ -165,7 +167,7 @@ class AscendDeepseekV4IndexerCache(DeepseekV4IndexerCache):
             compress_ratio=self.compress_ratio,
             cache_dtype_str=self.cache_config.cache_dtype,
             scale_dim=1 if self.head_dim == 128 else 0,
-            scale_dtype=torch.float if get_ascend_device_type() in {AscendDeviceType.A5} else torch.float16,
+            scale_dtype=torch.float if use_a5_kv_cache_layout(vllm_config) else torch.float16,
         )
 
     def forward(self): ...
@@ -189,10 +191,10 @@ class AscendDeepseekV4SWACache(VllmDeepseekV4SWACache):
         self.block_size = _dsv4_block_sizes()[cache_config.block_size][0][1]
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        if get_ascend_device_type() in {AscendDeviceType.A5}:
+        if use_a5_kv_cache_layout(vllm_config):
             self.dtype = torch.float8_e4m3fn
             vllm_config.cache_config.cache_dtype = "float8_e4m3fn"
-        cached_head_size = self.head_dim + 128 if get_ascend_device_type() in {AscendDeviceType.A5} else self.head_dim
+        cached_head_size = self.head_dim + 128 if use_a5_kv_cache_layout(vllm_config) else self.head_dim
         return AscendSlidingWindowMLASpec(
             block_size=self.block_size,
             num_kv_heads=1,
@@ -564,8 +566,7 @@ class Indexer(nn.Module):
             prefix=f"{prefix}.weights_proj",
             return_bias=False,
         )
-        ascend_device_type = get_ascend_device_type()
-        k_dtype = torch.float8_e4m3fn if ascend_device_type == AscendDeviceType.A5 else torch.int8
+        k_dtype = torch.float8_e4m3fn if use_a5_kv_cache_layout(vllm_config) else torch.int8
 
         if self.compress_ratio == 4:
             # TODO(cmq): change the dtype of cache
@@ -648,7 +649,7 @@ class Compressor(nn.Module):
                 dtype=state_dtype,
                 compress_ratio=compress_ratio,
                 prefix=f"{prefix}.state_cache",
-                block_size=_dsv4_block_sizes()[cache_config.block_size][0][2],  # type: ignore[union-attr]
+                block_size=_dsv4_block_sizes(vllm_config)[cache_config.block_size][0][2],  # type: ignore[union-attr]
             )
         elif compress_ratio == 128:
             self.state_cache = AscendCompressorStateCache(
@@ -656,7 +657,7 @@ class Compressor(nn.Module):
                 dtype=state_dtype,
                 compress_ratio=compress_ratio,
                 prefix=f"{prefix}.state_cache",
-                block_size=_dsv4_block_sizes()[cache_config.block_size][0][3],  # type: ignore[union-attr]
+                block_size=_dsv4_block_sizes(vllm_config)[cache_config.block_size][0][3],  # type: ignore[union-attr]
             )
         else:
             raise ValueError(
@@ -850,8 +851,7 @@ class DeepseekV4Attention(nn.Module):
                 if 0 <= indexer_seq_idx < len(pattern):
                     skip_topk = pattern[indexer_seq_idx] == "S"
 
-        ascend_device_type = get_ascend_device_type()
-        k_dtype = torch.float8_e4m3fn if ascend_device_type == AscendDeviceType.A5 else torch.bfloat16
+        k_dtype = torch.float8_e4m3fn if use_a5_kv_cache_layout(vllm_config) else torch.bfloat16
         swa_cache_layer = AscendDeepseekV4SWACache(
             head_dim=self.head_dim,
             window_size=self.window_size,

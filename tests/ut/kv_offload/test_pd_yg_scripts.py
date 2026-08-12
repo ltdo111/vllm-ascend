@@ -36,7 +36,12 @@ def test_prefill_and_decode_templates_have_valid_kv_transfer_config():
         assert config["kv_connector"] == "MooncakeHybridConnector"
         extra_config = config["kv_connector_extra_config"]
         assert extra_config["heterogeneous_pd"] is True
-        assert extra_config["prefill"] == {"dp_size": 8, "tp_size": 1}
-        assert extra_config["decode"] == {"dp_size": 4, "tp_size": 1}
+        assert extra_config["enable_heterogeneous_transfer"] is True
+        assert extra_config["prefill"]["dp_size"] == 8
+        assert extra_config["prefill"]["tp_size"] == 1
+        assert extra_config["decode"] == {"device_type": "A5", "dp_size": 4, "tp_size": 1}
         assert extra_config["protocol"] == "ascend"
         assert extra_config["device_name"] == ""
+    assert configs[0]["kv_connector_extra_config"]["prefill"]["device_type"] == "A2"
+    assert configs[1]["kv_connector_extra_config"]["prefill"]["device_type"] == "A3"
+    assert configs[2]["kv_connector_extra_config"]["prefill"]["device_type"] == "A2"

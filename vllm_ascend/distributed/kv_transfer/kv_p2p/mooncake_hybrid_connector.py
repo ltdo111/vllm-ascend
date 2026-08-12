@@ -1733,6 +1733,14 @@ class MooncakeConnectorWorker:
         self.transfer_protocol = vllm_config.kv_transfer_config.get_from_extra_config("protocol", "ascend")
         self.transfer_device_name = vllm_config.kv_transfer_config.get_from_extra_config("device_name", None)
         self.heterogeneous_pd = vllm_config.kv_transfer_config.get_from_extra_config("heterogeneous_pd", False)
+        self.enable_heterogeneous_transfer = vllm_config.kv_transfer_config.get_from_extra_config(
+            "enable_heterogeneous_transfer",
+            False,
+        )
+        self.enable_heterogeneous_transfer = self.enable_heterogeneous_transfer or vllm_config.kv_transfer_config.get_from_extra_config(
+            "heterogeneous_transfer",
+            False,
+        )
         # get prefill tp and dp size from extra config
         prefill_parallel_config: dict[str, Any] = vllm_config.kv_transfer_config.get_from_extra_config("prefill", {})
 
@@ -1753,6 +1761,13 @@ class MooncakeConnectorWorker:
         if "dp_size" not in decode_parallel_config:
             raise ValueError("MooncakeHybridConnector requires kv_connector_extra_config.decode.dp_size.")
         self._decode_dp_size = decode_parallel_config["dp_size"]
+        self._prefill_device_type = prefill_parallel_config.get("device_type")
+        self._decode_device_type = decode_parallel_config.get("device_type")
+        if self.enable_heterogeneous_transfer and str(self._decode_device_type).upper() != "A5":
+            raise ValueError(
+                "MooncakeHybridConnector enable_heterogeneous_transfer currently supports only "
+                "Prefill A2/A3 -> Decode A5. Please set kv_connector_extra_config.decode.device_type='A5'."
+            )
         # get prefill pp size from extra config
         self._decode_pp_size = decode_parallel_config.get("pp_size", 1)
         assert self._decode_pp_size == 1, "decode pp size must be 1"

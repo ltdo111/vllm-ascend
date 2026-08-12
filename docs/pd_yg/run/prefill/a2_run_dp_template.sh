@@ -68,11 +68,14 @@ vllm serve "$prefill_model_path" \
                 "protocol": "'"$transfer_protocol"'",
                 "device_name": "'"$transfer_device_name"'",
                 "heterogeneous_pd": true,
+                "enable_heterogeneous_transfer": true,
                 "prefill": {
+                    "device_type": "A2",
                     "dp_size": 8,
                     "tp_size": 1
                 },
                 "decode": {
+                    "device_type": "A5",
                     "dp_size": 4,
                     "tp_size": 1
                 }

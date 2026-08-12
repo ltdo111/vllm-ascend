@@ -126,8 +126,9 @@ class TestHybridConnectorExtraConfig(unittest.TestCase):
                 "protocol": "rdma",
                 "device_name": "mlx5_0",
                 "heterogeneous_pd": True,
-                "prefill": {"dp_size": 8, "tp_size": 1},
-                "decode": {"dp_size": 4, "tp_size": 1},
+                "enable_heterogeneous_transfer": True,
+                "prefill": {"device_type": "A3", "dp_size": 8, "tp_size": 1},
+                "decode": {"device_type": "A5", "dp_size": 4, "tp_size": 1},
             }
         )
 
@@ -136,8 +137,24 @@ class TestHybridConnectorExtraConfig(unittest.TestCase):
         self.assertEqual(worker.transfer_protocol, "rdma")
         self.assertEqual(worker.transfer_device_name, "mlx5_0")
         self.assertTrue(worker.heterogeneous_pd)
+        self.assertTrue(worker.enable_heterogeneous_transfer)
+        self.assertEqual(worker._prefill_device_type, "A3")
+        self.assertEqual(worker._decode_device_type, "A5")
         self.assertEqual(worker._prefill_dp_size, 8)
         self.assertEqual(worker._decode_dp_size, 4)
+
+    def test_get_extra_config_rejects_heterogeneous_transfer_without_a5_decode(self):
+        worker = object.__new__(MooncakeConnectorWorker)
+        config = self._make_vllm_config(
+            {
+                "enable_heterogeneous_transfer": True,
+                "prefill": {"device_type": "A3", "dp_size": 8, "tp_size": 1},
+                "decode": {"device_type": "A3", "dp_size": 4, "tp_size": 1},
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "Decode A5"):
+            worker._get_kv_connector_extra_config(config)
 
     def test_get_extra_config_rejects_missing_prefill_topology(self):
         worker = object.__new__(MooncakeConnectorWorker)

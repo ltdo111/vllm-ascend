@@ -26,7 +26,7 @@ from vllm_ascend.attention.utils import (
     wait_for_kv_layer_from_connector,
 )
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
-from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.device.device_op import A5DeviceAdaptor, BaseDeviceAdaptor, DeviceOperator
 from vllm_ascend.distributed.parallel_state import get_otp_group
 from vllm_ascend.memcache_comm_fence import record_attention_compute_start
 from vllm_ascend.ops.cv_linear import CVLinearWrapper
@@ -40,6 +40,7 @@ from vllm_ascend.utils import (
     npu_stream_switch,
     olora_tp_enable,
     oproj_tp_enable,
+    use_a5_kv_cache_layout,
 )
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 
@@ -387,6 +388,8 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.device = device
+        self.use_a5_kv_layout = use_a5_kv_cache_layout(vllm_config)
+        self._dsa_kv_ops = A5DeviceAdaptor if self.use_a5_kv_layout else BaseDeviceAdaptor
         scheduler_config = vllm_config.scheduler_config
         # self.block_size = vllm_config.cache_config.block_size
         self.max_blocks = (vllm_config.model_config.max_model_len + self.block_size - 1) // self.block_size
@@ -394,7 +397,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         self.speculative_config = vllm_config.speculative_config
         self.decode_threshold = 1
         self.spec_slot_mapping = None
-        if get_ascend_device_type() in {AscendDeviceType.A5}:
+        if self.use_a5_kv_layout:
             self.slot_mapping_shape = (vllm_config.scheduler_config.max_num_batched_tokens,)  # type: ignore
         else:
             self.slot_mapping_shape = (vllm_config.scheduler_config.max_num_batched_tokens, 2)  # type: ignore
@@ -611,7 +614,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
 
         # NOTE: Currently, MTP-fullgraph is incompatibility pcp
         slot_mapping = common_attn_metadata.slot_mapping[:num_input_tokens]
-        self.slot_mapping[:num_input_tokens] = DeviceOperator.format_dsa_slot_mapping(slot_mapping, self.block_size)
+        self.slot_mapping[:num_input_tokens] = self._dsa_kv_ops.format_dsa_slot_mapping(slot_mapping, self.block_size)
 
         self.graph_pad_size = common_attn_metadata.graph_pad_size
         block_table_size = self.get_block_table_size(common_attn_metadata, BUILD_METADATA_STEP_PREFILL)
@@ -742,8 +745,8 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         cu_c4_cmp_seqlen_list = None
         cu_c128_cmp_seqlen_list = None
 
-        metadata_op = DeviceOperator.get_dsa_sparse_attn_metadata_op()
-        metadata_kwargs = DeviceOperator.get_dsa_sparse_attn_metadata_kwargs(self.seqused_q.device)
+        metadata_op = self._dsa_kv_ops.get_dsa_sparse_attn_metadata_op()
+        metadata_kwargs = self._dsa_kv_ops.get_dsa_sparse_attn_metadata_kwargs(self.seqused_q.device)
         if self.compressor_ratio <= 1:
             if self.prefill_ratio_to_sas_metadata.get(layer_name) is None:
                 self.prefill_ratio_to_sas_metadata[layer_name] = metadata_op(
@@ -949,7 +952,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             slot_mapping = None
         else:
             num_compressed_tokens = self.num_decode_tokens
-            slot_mapping = DeviceOperator.pad_dsa_decode_slot_mapping(
+            slot_mapping = self._dsa_kv_ops.pad_dsa_decode_slot_mapping(
                 self.slot_mapping[: self.num_decode_tokens],
                 self.num_decode_tokens,
                 self.compressor_ratio,
@@ -962,7 +965,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
 
         assert self.decode_sas_metadata is not None
 
-        cu_seqlens_ori_kv = DeviceOperator.get_dsa_decode_cu_seqlens_ori_kv(
+        cu_seqlens_ori_kv = self._dsa_kv_ops.get_dsa_decode_cu_seqlens_ori_kv(
             self.decode_ratio_to_sas_metadata,
             "cu_seqlens_ori_kv",
             self.seq_lens,
@@ -970,9 +973,9 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             self._zero_i32,
             self.cu_seqlens_ori_kv,
         )
-        metadata_op = DeviceOperator.get_dsa_sparse_attn_metadata_op()
-        metadata_kwargs = DeviceOperator.get_dsa_sparse_attn_metadata_kwargs(self.seqused_q.device)
-        cu_seqlens_cmp_kv = DeviceOperator.get_dsa_decode_cu_seqlens_cmp_kv(self.cu_seqlens_cmp_kv)
+        metadata_op = self._dsa_kv_ops.get_dsa_sparse_attn_metadata_op()
+        metadata_kwargs = self._dsa_kv_ops.get_dsa_sparse_attn_metadata_kwargs(self.seqused_q.device)
+        cu_seqlens_cmp_kv = self._dsa_kv_ops.get_dsa_decode_cu_seqlens_cmp_kv(self.cu_seqlens_cmp_kv)
         if self.compressor_ratio <= 1:
             if self.decode_ratio_to_sas_metadata.get(layer_name) is None:
                 self.decode_ratio_to_sas_metadata[layer_name] = metadata_op(
@@ -1124,7 +1127,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             cos, sin = get_cos_and_sin_dsa(input_positions, use_cache=True, draft_index=draft_index)
 
         slot_mapping = common_attn_metadata.slot_mapping[:num_input_tokens]
-        self.spec_slot_mapping[draft_index - 1][:num_input_tokens] = DeviceOperator.format_dsa_slot_mapping(  # type: ignore[index]
+        self.spec_slot_mapping[draft_index - 1][:num_input_tokens] = self._dsa_kv_ops.format_dsa_slot_mapping(  # type: ignore[index]
             slot_mapping, self.block_size
         )
 
@@ -1193,8 +1196,8 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         prefill_slot_mapping = self.spec_slot_mapping[draft_index - 1][tokens_start:num_prefill_tokens]  # type: ignore[index]
         block_table = common_attn_metadata.block_table_tensor[: common_attn_metadata.num_reqs]
 
-        metadata_op = DeviceOperator.get_dsa_sparse_attn_metadata_op()
-        metadata_kwargs = DeviceOperator.get_dsa_sparse_attn_metadata_kwargs(self.seqused_q.device)
+        metadata_op = self._dsa_kv_ops.get_dsa_sparse_attn_metadata_op()
+        metadata_kwargs = self._dsa_kv_ops.get_dsa_sparse_attn_metadata_kwargs(self.seqused_q.device)
         sas_metadata = metadata_op(
             **metadata_kwargs,
             num_heads_q=n_local_heads,
@@ -1273,8 +1276,8 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         slot_mapping = self.spec_slot_mapping[draft_index - 1][:num_decode_tokens_typed]  # type: ignore[index]
         block_table = common_attn_metadata.block_table_tensor
 
-        metadata_op = DeviceOperator.get_dsa_sparse_attn_metadata_op()
-        metadata_kwargs = DeviceOperator.get_dsa_sparse_attn_metadata_kwargs(self.seqused_q.device)
+        metadata_op = self._dsa_kv_ops.get_dsa_sparse_attn_metadata_op()
+        metadata_kwargs = self._dsa_kv_ops.get_dsa_sparse_attn_metadata_kwargs(self.seqused_q.device)
 
         decode_sas_metadata = metadata_op(
             **metadata_kwargs,
@@ -1419,6 +1422,8 @@ class AscendDSAImpl(DSAAttentionImpl):
         ascend_config = get_ascend_config()
         self.multistream_dsv4_dsa_overlap = ascend_config.multistream_dsv4_dsa_overlap
         self.vllm_config = get_current_vllm_config()
+        self.use_a5_kv_layout = use_a5_kv_cache_layout(self.vllm_config)
+        self._dsa_kv_ops = A5DeviceAdaptor if self.use_a5_kv_layout else BaseDeviceAdaptor
 
         # indexer param
         if self.indexer is not None:
@@ -1521,7 +1526,7 @@ class AscendDSAImpl(DSAAttentionImpl):
             metadata.start_pos,
             metadata.block_table,
             metadata.block_size,
-            DeviceOperator.get_dsa_compressor_slot_mapping_format(),
+            self._dsa_kv_ops.get_dsa_compressor_slot_mapping_format(),
             self.compress_ratio,
             metadata.num_compressed_tokens,
             metadata.num_reqs_actual,
@@ -1804,7 +1809,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                 rotary_mode="interleave",
                 partial_slice=[self.nope_head_dim, self.head_dim],
             )
-            DeviceOperator.dsa_kv_compress_scatter(swa_kv_cache, kv, slot_mapping)
+            self._dsa_kv_ops.dsa_kv_compress_scatter(swa_kv_cache, kv, slot_mapping)
 
         if is_prefill:
             q = self.cv_wq_b.matmul(q_b_quant, q_b_scale).unflatten(-1, (self.n_local_heads, self.head_dim))
@@ -1843,7 +1848,7 @@ class AscendDSAImpl(DSAAttentionImpl):
     ):
         compress_common_attn_metadata = None
         (compress_kv_cache, swa_kv_cache, state_cache, indexer_k_cache, indexer_scale_cache, indexer_full_cache) = (
-            DeviceOperator.unpack_dsa_forward_kv_cache(kv_cache, self.compress_ratio)
+            self._dsa_kv_ops.unpack_dsa_forward_kv_cache(kv_cache, self.compress_ratio)
         )
 
         if self.compress_ratio == 4:
@@ -1940,11 +1945,11 @@ class AscendDSAImpl(DSAAttentionImpl):
             )
 
             # swa exec kv
-            DeviceOperator.dsa_kv_compress_scatter(swa_kv_cache, kv, swa_prefill_metadata.slot_mapping)
+            self._dsa_kv_ops.dsa_kv_compress_scatter(swa_kv_cache, kv, swa_prefill_metadata.slot_mapping)
 
-        attn_op = DeviceOperator.get_dsa_sparse_attn_op()
-        extra_attn_kwargs: dict = DeviceOperator.get_dsa_sparse_attn_base_kwargs()
-        DeviceOperator.add_dsa_sparse_attn_extra_kwargs(extra_attn_kwargs, cu_seqlens_ori_kv=actual_seq_lengths_query)
+        attn_op = self._dsa_kv_ops.get_dsa_sparse_attn_op()
+        extra_attn_kwargs: dict = self._dsa_kv_ops.get_dsa_sparse_attn_base_kwargs()
+        self._dsa_kv_ops.add_dsa_sparse_attn_extra_kwargs(extra_attn_kwargs, cu_seqlens_ori_kv=actual_seq_lengths_query)
 
         if self.compress_ratio <= 1:
             notify_kv_cache_written(layer_name)
@@ -2044,12 +2049,12 @@ class AscendDSAImpl(DSAAttentionImpl):
                     torch.npu.current_stream().wait_event(e_compressed_kv_done)
                     weights_proj_output = self.weights_proj(hidden_states)
                 # Main stream: q_quant (between compressed_kv and kv_scatter)
-                q_quant, q_scale = DeviceOperator.indexer_quantize_query(indexer_q)
+                q_quant, q_scale = self._dsa_kv_ops.indexer_quantize_query(indexer_q)
 
             # A zero-row compressor output has no KV writes. Skip scatter
             # instead of passing None; A5 scatter dereferences x.view().
             if compressed_kv.shape[0] > 0:
-                DeviceOperator.dsa_kv_compress_scatter(compress_kv_cache, compressed_kv, compress_slot_mapping)
+                self._dsa_kv_ops.dsa_kv_compress_scatter(compress_kv_cache, compressed_kv, compress_slot_mapping)
 
             if self.multistream_dsv4_dsa_overlap and self.compress_ratio == 4 and not self.skip_topk:
                 # Wait aux_stream weights_proj done, then compute dot
@@ -2064,9 +2069,9 @@ class AscendDSAImpl(DSAAttentionImpl):
                 compress_topk_idxs, _ = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer(
                     query=q_quant,
                     key=indexer_k_cache,
-                    weights=DeviceOperator.prepare_dsa_indexer_weights(weights),
-                    query_dequant_scale=DeviceOperator.prepare_dsa_indexer_query_scale(q_scale),
-                    key_dequant_scale=DeviceOperator.prepare_dsa_indexer_key_scale(indexer_scale_cache),
+                    weights=self._dsa_kv_ops.prepare_dsa_indexer_weights(weights),
+                    query_dequant_scale=self._dsa_kv_ops.prepare_dsa_indexer_query_scale(q_scale),
+                    key_dequant_scale=self._dsa_kv_ops.prepare_dsa_indexer_key_scale(indexer_scale_cache),
                     actual_seq_lengths_query=qlens,
                     actual_seq_lengths_key=kvlens,
                     block_table=block_table,
@@ -2090,7 +2095,7 @@ class AscendDSAImpl(DSAAttentionImpl):
             record_attention_compute_start()
 
             if self.compress_ratio == 4:
-                DeviceOperator.add_dsa_sparse_attn_extra_kwargs(
+                self._dsa_kv_ops.add_dsa_sparse_attn_extra_kwargs(
                     extra_attn_kwargs, cu_seqlens_cmp_kv=common_prefill_metadata.cu_c4_cmp_seqlen_list
                 )
                 attn_output = attn_op(
@@ -2115,7 +2120,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                     **extra_attn_kwargs,
                 )[0]
             else:
-                DeviceOperator.add_dsa_sparse_attn_extra_kwargs(
+                self._dsa_kv_ops.add_dsa_sparse_attn_extra_kwargs(
                     extra_attn_kwargs, cu_seqlens_cmp_kv=common_prefill_metadata.cu_c128_cmp_seqlen_list
                 )
                 attn_output = attn_op(
@@ -2151,7 +2156,7 @@ class AscendDSAImpl(DSAAttentionImpl):
         compress_common_attn_metadata = None
 
         (compress_kv_cache, swa_kv_cache, state_cache, indexer_k_cache, indexer_scale_cache, indexer_full_cache) = (
-            DeviceOperator.unpack_dsa_forward_kv_cache(kv_cache, self.compress_ratio)
+            self._dsa_kv_ops.unpack_dsa_forward_kv_cache(kv_cache, self.compress_ratio)
         )
 
         if self.compress_ratio == 4:
@@ -2262,7 +2267,7 @@ class AscendDSAImpl(DSAAttentionImpl):
             )
 
             # swa exec kv
-            DeviceOperator.dsa_kv_compress_scatter(swa_kv_cache, kv, swa_decode_metadata.slot_mapping)
+            self._dsa_kv_ops.dsa_kv_compress_scatter(swa_kv_cache, kv, swa_decode_metadata.slot_mapping)
 
         if self.compress_ratio > 1:
             compressor_decode_metadata = _require_decode_metadata(compressor_attn_metadata)
@@ -2338,12 +2343,12 @@ class AscendDSAImpl(DSAAttentionImpl):
                     torch.npu.current_stream().wait_event(e_compressed_kv_done)
                     weights_proj_output = self.weights_proj(hidden_states)
                 # Main stream: q_quant (between compressed_kv and kv_scatter)
-                q_quant, q_scale = DeviceOperator.indexer_quantize_query(indexer_q)
+                q_quant, q_scale = self._dsa_kv_ops.indexer_quantize_query(indexer_q)
 
             # A zero-row compressor output has no KV writes. Skip scatter
             # instead of passing None; A5 scatter dereferences x.view().
             if compressed_kv.shape[0] > 0:
-                DeviceOperator.dsa_kv_compress_scatter(compress_kv_cache, compressed_kv, compress_slot_mapping)
+                self._dsa_kv_ops.dsa_kv_compress_scatter(compress_kv_cache, compressed_kv, compress_slot_mapping)
 
             if self.multistream_dsv4_dsa_overlap and self.compress_ratio == 4 and not self.skip_topk:
                 # Wait aux_stream weights_proj done
@@ -2358,9 +2363,9 @@ class AscendDSAImpl(DSAAttentionImpl):
                 compress_topk_idxs, _ = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer(
                     query=q_quant,
                     key=indexer_k_cache,
-                    weights=DeviceOperator.prepare_dsa_indexer_weights(weights),
-                    query_dequant_scale=DeviceOperator.prepare_dsa_indexer_query_scale(q_scale),
-                    key_dequant_scale=DeviceOperator.prepare_dsa_indexer_key_scale(indexer_scale_cache),
+                    weights=self._dsa_kv_ops.prepare_dsa_indexer_weights(weights),
+                    query_dequant_scale=self._dsa_kv_ops.prepare_dsa_indexer_query_scale(q_scale),
+                    key_dequant_scale=self._dsa_kv_ops.prepare_dsa_indexer_key_scale(indexer_scale_cache),
                     actual_seq_lengths_query=qlens,
                     actual_seq_lengths_key=kvlens,
                     block_table=block_table,
@@ -2382,8 +2387,8 @@ class AscendDSAImpl(DSAAttentionImpl):
 
         notify_kv_cache_written(layer_name)
         record_attention_compute_start()
-        attn_op = DeviceOperator.get_dsa_sparse_attn_op()
-        extra_attn_kwargs: dict = DeviceOperator.get_dsa_sparse_attn_base_kwargs()
+        attn_op = self._dsa_kv_ops.get_dsa_sparse_attn_op()
+        extra_attn_kwargs: dict = self._dsa_kv_ops.get_dsa_sparse_attn_base_kwargs()
 
         if self.compress_ratio <= 1:
             attn_output = attn_op(
@@ -2461,7 +2466,7 @@ class AscendDSAImpl(DSAAttentionImpl):
         qr_pertoken_scale: torch.Tensor = None,
     ):
         (indexer_state_cache, indexer_k_cache, indexer_scale_cache, indexer_full_cache) = (
-            DeviceOperator.unpack_dsa_indexer_kv_cache(kv_cache)
+            self._dsa_kv_ops.unpack_dsa_indexer_kv_cache(kv_cache)
         )
         (
             _,
@@ -2594,7 +2599,7 @@ class AscendDSAImpl(DSAAttentionImpl):
         indexer_full_cache: torch.Tensor | None,
         slot_mapping: torch.Tensor,
     ):
-        return DeviceOperator.indexer_quant_scatter(
+        return self._dsa_kv_ops.indexer_quant_scatter(
             q, kv, indexer_k_cache, indexer_scale_cache, indexer_full_cache, slot_mapping
         )
 
@@ -2624,9 +2629,9 @@ class AscendDSAImpl(DSAAttentionImpl):
         topk_idxs, _ = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer(
             query=q,
             key=indexer_k_cache,
-            weights=DeviceOperator.prepare_dsa_indexer_weights(weights),
-            query_dequant_scale=DeviceOperator.prepare_dsa_indexer_query_scale(q_scale),
-            key_dequant_scale=DeviceOperator.prepare_dsa_indexer_key_scale(indexer_scale_cache),
+            weights=self._dsa_kv_ops.prepare_dsa_indexer_weights(weights),
+            query_dequant_scale=self._dsa_kv_ops.prepare_dsa_indexer_query_scale(q_scale),
+            key_dequant_scale=self._dsa_kv_ops.prepare_dsa_indexer_key_scale(indexer_scale_cache),
             actual_seq_lengths_query=qlens,
             actual_seq_lengths_key=kvlens,
             block_table=block_table,
@@ -2708,7 +2713,7 @@ class AscendDSAImpl(DSAAttentionImpl):
         - Part4: Caller runs weights_proj + q_quant + indexer
         """
         (indexer_state_cache, indexer_k_cache, indexer_scale_cache, indexer_full_cache) = (
-            DeviceOperator.unpack_dsa_indexer_kv_cache(kv_cache)
+            self._dsa_kv_ops.unpack_dsa_indexer_kv_cache(kv_cache)
         )
         # sorted keys: [attn, compressor.state_cache, indexer.compressor.state_cache, indexer.k_cache, swa_cache]
         (_, _, indexer_kv_state_metadata, indexer_kv_scale_metadata, _) = attn_metadata
@@ -2776,7 +2781,7 @@ class AscendDSAImpl(DSAAttentionImpl):
         if kv is not None:
             with npu_stream_switch(aux_stream, enabled=True):
                 torch.npu.current_stream().wait_event(e_kv_ready)
-                kv, kv_scale = DeviceOperator.indexer_quant_scatter_part1(
+                kv, kv_scale = self._dsa_kv_ops.indexer_quant_scatter_part1(
                     kv, indexer_k_cache, indexer_full_cache, slot_mapping_indexer
                 )
 
@@ -2820,7 +2825,7 @@ class AscendDSAImpl(DSAAttentionImpl):
         if kv is not None and kv_scale is not None:
             with npu_stream_switch(aux_stream, enabled=True):
                 torch.npu.current_stream().wait_event(e_rope_done)
-                DeviceOperator.dsa_indexer_scatter_scale_part3(kv_scale, indexer_scale_cache, slot_mapping_indexer)
+                self._dsa_kv_ops.dsa_indexer_scatter_scale_part3(kv_scale, indexer_scale_cache, slot_mapping_indexer)
 
         # Main: q_hadamard[Part1 - linear] (directly submit, C/AIV different engines dispatch naturally)
         # Part1: F.linear - parallel with aux_stream kv_scatter
