@@ -235,6 +235,12 @@ class TestUtils(TestBase):
         hits = utils.vllm_version_is.cache_info().hits
         self.assertEqual(hits, 1)
 
+    def test_uses_mooncake_connector_includes_hybrid_and_layerwise(self):
+        self.assertTrue(utils.uses_mooncake_connector({"kv_connector": "MooncakeHybridConnector"}))
+        self.assertTrue(utils.uses_mooncake_connector({"kv_connector": "MooncakeLayerwiseConnector"}))
+        self.assertTrue(utils.uses_mooncake_connector({"kv_connector": "MooncakeConnectorV1"}))
+        self.assertFalse(utils.uses_mooncake_connector({"kv_connector": "LMCacheConnectorV1"}))
+
     def test_get_max_hidden_layers(self):
         from transformers import PretrainedConfig
 

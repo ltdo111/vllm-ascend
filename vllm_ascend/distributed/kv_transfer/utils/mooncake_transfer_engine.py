@@ -5,10 +5,12 @@ class GlobalTE:
     def __init__(self):
         self.transfer_engine = None
         self.is_register_buffer: bool = False
+        self.init_config: tuple[str, str, str] | None = None
         self.transfer_engine_lock = threading.Lock()
         self.register_buffer_lock = threading.Lock()
 
-    def get_transfer_engine(self, hostname: str, device_name: str | None):
+    def get_transfer_engine(self, hostname: str, device_name: str | None, protocol: str = "ascend"):
+        device_name = device_name if device_name is not None else ""
         if self.transfer_engine is None:
             with self.transfer_engine_lock:
                 # Double-Checked Locking
@@ -22,10 +24,15 @@ class GlobalTE:
                             "to run vLLM with MooncakeConnector."
                         ) from e
                     self.transfer_engine = TransferEngine()
-                    device_name = device_name if device_name is not None else ""
-                    ret_value = self.transfer_engine.initialize(hostname, "P2PHANDSHAKE", "ascend", device_name)
+                    ret_value = self.transfer_engine.initialize(hostname, "P2PHANDSHAKE", protocol, device_name)
                     if ret_value != 0:
                         raise RuntimeError(f"TransferEngine initialization failed with ret_value: {ret_value}")
+                    self.init_config = (hostname, protocol, device_name)
+        elif self.init_config != (hostname, protocol, device_name):
+            raise RuntimeError(
+                "Mooncake TransferEngine has already been initialized with "
+                f"{self.init_config}, but got {(hostname, protocol, device_name)}."
+            )
         return self.transfer_engine
 
     def register_buffer(self, ptrs: list[int], sizes: list[int]):

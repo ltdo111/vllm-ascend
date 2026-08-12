@@ -19,7 +19,10 @@ from vllm.v1.request import RequestStatus  # noqa: E402
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_hybrid_connector import (  # noqa: E402
     MAX_REQUESTS_PER_PEER_HANDLER,
     KVCacheRecvingThread,
+    MooncakeConnectorWorker,
     MooncakeConnectorScheduler,
+    _build_kv_cache_signature,
+    _validate_kv_cache_signature,
 )
 
 
@@ -40,6 +43,108 @@ class MockRequest:
         self.kv_transfer_params = kv_transfer_params
         self.status = status
         self.output_token_ids = [101]
+
+
+class TestHybridKVCacheSignature(unittest.TestCase):
+
+    def test_build_signature_uses_block_layout_not_num_blocks(self):
+        kv_caches = {
+            "layer.0": torch.zeros(4, 2, 8, dtype=torch.bfloat16),
+        }
+        signature = _build_kv_cache_signature(
+            kv_caches=kv_caches,
+            block_lens=[],
+            block_stride_per_addr=[],
+            addr_group_idx=[],
+            kv_cache_config=MagicMock(kv_cache_groups=[], kv_cache_tensors=[]),
+            use_hybrid=False,
+            use_mamba=False,
+            use_compress=False,
+            num_blocks=4,
+        )
+
+        self.assertEqual(len(signature), 1)
+        self.assertEqual(signature[0]["dtype"], "bfloat16")
+        self.assertEqual(signature[0]["block_shape"], [2, 8])
+        self.assertEqual(signature[0]["block_len"], 32)
+
+    def test_validate_signature_rejects_dtype_mismatch(self):
+        local_signature = [
+            {
+                "layer_name": "layer.0",
+                "dtype": "bfloat16",
+                "block_shape": [2, 8],
+                "block_stride_elems": 16,
+                "element_size": 2,
+                "block_len": 32,
+                "block_stride": 32,
+                "group_idx": [],
+            }
+        ]
+        remote_signature = [
+            {
+                **local_signature[0],
+                "dtype": "float8_e4m3fn",
+                "element_size": 1,
+                "block_len": 16,
+                "block_stride": 16,
+            }
+        ]
+
+        with self.assertRaisesRegex(ValueError, "mismatched_fields"):
+            _validate_kv_cache_signature(local_signature, remote_signature, [32], [16])
+
+    def test_validate_signature_accepts_matching_layout_with_different_layer_names(self):
+        local_signature = [
+            {
+                "layer_name": "local_layer",
+                "dtype": "bfloat16",
+                "block_shape": [2, 8],
+                "block_stride_elems": 16,
+                "element_size": 2,
+                "block_len": 32,
+                "block_stride": 32,
+                "group_idx": [0],
+            }
+        ]
+        remote_signature = [{**local_signature[0], "layer_name": "remote_layer"}]
+
+        _validate_kv_cache_signature(local_signature, remote_signature, [32], [32])
+
+
+class TestHybridConnectorExtraConfig(unittest.TestCase):
+
+    def _make_vllm_config(self, extra_config):
+        kv_transfer_config = MagicMock()
+        kv_transfer_config.get_from_extra_config.side_effect = lambda key, default=None: extra_config.get(key, default)
+        return MagicMock(kv_transfer_config=kv_transfer_config)
+
+    def test_get_extra_config_reads_transfer_protocol_and_topology(self):
+        worker = object.__new__(MooncakeConnectorWorker)
+        config = self._make_vllm_config(
+            {
+                "protocol": "rdma",
+                "device_name": "mlx5_0",
+                "heterogeneous_pd": True,
+                "prefill": {"dp_size": 8, "tp_size": 1},
+                "decode": {"dp_size": 4, "tp_size": 1},
+            }
+        )
+
+        worker._get_kv_connector_extra_config(config)
+
+        self.assertEqual(worker.transfer_protocol, "rdma")
+        self.assertEqual(worker.transfer_device_name, "mlx5_0")
+        self.assertTrue(worker.heterogeneous_pd)
+        self.assertEqual(worker._prefill_dp_size, 8)
+        self.assertEqual(worker._decode_dp_size, 4)
+
+    def test_get_extra_config_rejects_missing_prefill_topology(self):
+        worker = object.__new__(MooncakeConnectorWorker)
+        config = self._make_vllm_config({"prefill": {"dp_size": 8}, "decode": {"dp_size": 4, "tp_size": 1}})
+
+        with self.assertRaisesRegex(ValueError, "prefill.tp_size"):
+            worker._get_kv_connector_extra_config(config)
 
 
 class TestHybridKVCacheRecvingThreadDispatch(unittest.TestCase):

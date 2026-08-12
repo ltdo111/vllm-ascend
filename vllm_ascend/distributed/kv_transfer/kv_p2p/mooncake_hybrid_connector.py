@@ -87,6 +87,7 @@ class MooncakeAgentMetadata(msgspec.Struct, omit_defaults=True, dict=True):
     num_blocks: int
     block_lens: list[int]
     ssm_sizes: tuple[int, int]
+    kv_cache_signature: list[dict[str, Any]] | None = None
     local_ip: str = ""
 
 
@@ -122,6 +123,138 @@ class SizedDict(OrderedDict):
             value: dict[int, list[int]] = {}
             self[key] = value
             return value
+
+
+def _dtype_name(dtype: torch.dtype) -> str:
+    return str(dtype).removeprefix("torch.")
+
+
+def _build_kv_cache_signature(
+    kv_caches: dict[str, Any],
+    block_lens: list[int],
+    block_stride_per_addr: list[int],
+    addr_group_idx: list[int],
+    kv_cache_config: KVCacheConfig,
+    use_hybrid: bool,
+    use_mamba: bool,
+    use_compress: bool,
+    num_blocks: int,
+) -> list[dict[str, Any]]:
+    """Build a stable description of the registered KV cache layout.
+
+    Mooncake transfers raw bytes between the producer and consumer. For
+    heterogeneous PD, the model config can match while the actual KV cache
+    tensor dtype/layout differs due to device-specific DeepSeek V4 code paths.
+    The signature intentionally uses realized tensors instead of model names.
+    """
+    signature: list[dict[str, Any]] = []
+    seen_addrs: set[int] = set()
+
+    def add_tensor(
+        layer_name: str,
+        tensor: torch.Tensor,
+        block_len: int | None = None,
+        block_stride: int | None = None,
+        group_idx: list[int] | None = None,
+    ) -> None:
+        tensor_addr = tensor.data_ptr()
+        if tensor_addr in seen_addrs:
+            return
+        seen_addrs.add(tensor_addr)
+        tensor_num_blocks = tensor.shape[0] if tensor.ndim > 0 else 0
+        block_size_scale = tensor_num_blocks // num_blocks if num_blocks else 0
+        block_shape = list(tensor.shape[1:])
+        inferred_block_len = tensor.element_size() * math.prod(block_shape) * block_size_scale
+        signature.append(
+            {
+                "layer_name": layer_name,
+                "dtype": _dtype_name(tensor.dtype),
+                "block_shape": block_shape,
+                "block_stride_elems": tensor.stride(0) if tensor.ndim > 0 else 0,
+                "element_size": tensor.element_size(),
+                "block_len": inferred_block_len if block_len is None else block_len,
+                "block_stride": tensor.stride(0) * tensor.element_size() if block_stride is None else block_stride,
+                "group_idx": [] if group_idx is None else group_idx,
+            }
+        )
+
+    if not use_hybrid:
+        for layer_name, kv_cache_tuple in kv_caches.items():
+            if not isinstance(kv_cache_tuple, (list, tuple)):
+                kv_cache_tuple = [kv_cache_tuple]
+            for single_kv_cache in kv_cache_tuple:
+                add_tensor(layer_name, single_kv_cache)
+        return signature
+
+    if use_mamba:
+        for layer_name, kv_cache_tuple in kv_caches.items():
+            if not isinstance(kv_cache_tuple, (list, tuple)):
+                kv_cache_tuple = [kv_cache_tuple]
+            for single_kv_cache in kv_cache_tuple:
+                add_tensor(layer_name, single_kv_cache)
+        return signature
+
+    if use_compress:
+        layer_group_idx = dict[str, int]()
+        for i, group in enumerate(kv_cache_config.kv_cache_groups):
+            for layer_name in group.layer_names:
+                layer_group_idx[layer_name] = i
+        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+            for layer_name in kv_cache_tensor.shared_by:
+                kv_cache_tuple = kv_caches[layer_name]
+                if not isinstance(kv_cache_tuple, (tuple, list)):
+                    kv_cache_tuple = [kv_cache_tuple]
+                group_idx = [layer_group_idx[layer_name]]
+                for single_tensor in kv_cache_tuple:
+                    add_tensor(layer_name, single_tensor, group_idx=group_idx)
+        return signature
+
+    return signature
+
+
+def _validate_kv_cache_signature(
+    local_signature: list[dict[str, Any]],
+    remote_signature: list[dict[str, Any]],
+    local_block_lens: list[int],
+    remote_block_lens: list[int],
+) -> None:
+    if not remote_signature:
+        logger.warning("Remote Mooncake metadata does not include KV cache signature; skip layout validation.")
+        return
+
+    if len(local_signature) != len(remote_signature):
+        raise ValueError(
+            "Incompatible MooncakeHybridConnector KV cache layout: signature entry count mismatch. "
+            f"local={len(local_signature)}, remote={len(remote_signature)}"
+        )
+
+    mismatch_fields = (
+        "dtype",
+        "block_shape",
+        "block_stride_elems",
+        "element_size",
+        "block_len",
+        "block_stride",
+        "group_idx",
+    )
+    for idx, (local_item, remote_item) in enumerate(zip(local_signature, remote_signature)):
+        mismatches = [
+            field
+            for field in mismatch_fields
+            if local_item.get(field) != remote_item.get(field)
+        ]
+        if mismatches:
+            raise ValueError(
+                "Incompatible MooncakeHybridConnector KV cache layout. "
+                f"entry={idx}, mismatched_fields={mismatches}, "
+                f"local={local_item}, remote={remote_item}"
+            )
+
+    if local_block_lens != remote_block_lens:
+        raise ValueError(
+            "Incompatible MooncakeHybridConnector KV cache block lengths. "
+            f"local={local_block_lens}, remote={remote_block_lens}"
+        )
 
 
 class KVCacheTaskTracker:
@@ -384,6 +517,7 @@ class KVCacheRecvingThread(threading.Thread):
         vllm_config: VllmConfig,
         kv_cache_config: KVCacheConfig,
         kv_caches: dict[str, Any],
+        local_kv_cache_signature: list[dict[str, Any]] | None = None,
         prefill_pp_layer_partition: str | None = None,
     ):
         super().__init__(daemon=True, name="KVCacheRecvingThread")
@@ -402,6 +536,7 @@ class KVCacheRecvingThread(threading.Thread):
         self.block_len_per_addr = block_len_per_addr
         self.block_stride_per_addr = block_stride_per_addr
         self.addr_group_idx = addr_group_idx
+        self.local_kv_cache_signature = local_kv_cache_signature or []
         self.hma_group_size = hma_group_size
         self.mamba_ssm_size = mamba_ssm_size
         self.remote_te_port: dict[str, dict[int, int]] = SizedDict()
@@ -965,6 +1100,12 @@ class KVCacheRecvingThread(threading.Thread):
             assert engine_id != self.local_engine_id, (
                 f"Conflict engine id {engine_id} with local engine id {self.local_engine_id}."
             )
+            _validate_kv_cache_signature(
+                self.local_kv_cache_signature,
+                agent_meta.kv_cache_signature or [],
+                self.block_len_per_addr,
+                agent_meta.block_lens,
+            )
             with self.remote_metadata_lock:
                 self.kv_caches_base_addr[engine_id][remote_handshake_port] = agent_meta.kv_caches_base_addr
                 self.remote_te_port[engine_id][remote_handshake_port] = agent_meta.te_rpc_port
@@ -1481,12 +1622,17 @@ class MooncakeConnectorWorker:
     """Implementation of Worker side methods"""
 
     def __init__(self, vllm_config: VllmConfig, engine_id: str, kv_cache_config: KVCacheConfig):
-        self._get_prefill_decode_size(vllm_config)
+        self._get_kv_connector_extra_config(vllm_config)
         os.environ["ASCEND_TRANSFER_TIMEOUT"] = str(get_transfer_timeout_value())
         if self._prefill_tp_size < self._decode_tp_size:
             raise ValueError(
                 f"prefill_tp_size: {self._prefill_tp_size} must be greater than"
                 f" or equal to the decode_tp_size: {self._decode_tp_size}"
+            )
+        if self._prefill_tp_size % self._decode_tp_size != 0:
+            raise ValueError(
+                "prefill_tp_size must be divisible by decode_tp_size for MooncakeHybridConnector. "
+                f"prefill_tp_size={self._prefill_tp_size}, decode_tp_size={self._decode_tp_size}"
             )
 
         # Metadata.
@@ -1557,7 +1703,11 @@ class MooncakeConnectorWorker:
         device_index = self.pp_rank * self.tp_size + self.tp_rank
         self.handshake_port = self.side_channel_port + device_index
         self.sockets: dict = {}
-        self.engine = global_te.get_transfer_engine(self.side_channel_host, device_name=None)
+        self.engine = global_te.get_transfer_engine(
+            self.side_channel_host,
+            device_name=self.transfer_device_name,
+            protocol=self.transfer_protocol,
+        )
         self.te_rpc_port = self.engine.get_rpc_port()
 
         # Background thread for sending or receiving KV caches.
@@ -1579,22 +1729,29 @@ class MooncakeConnectorWorker:
         self.local_remote_block_port_mapping: dict[str, list[list[int]] | None] = {}
         self.remote_port_send_num: dict[str, dict[int, RemotePortInfo]] = {}
 
-    def _get_prefill_decode_size(self, vllm_config: VllmConfig):
+    def _get_kv_connector_extra_config(self, vllm_config: VllmConfig):
+        self.transfer_protocol = vllm_config.kv_transfer_config.get_from_extra_config("protocol", "ascend")
+        self.transfer_device_name = vllm_config.kv_transfer_config.get_from_extra_config("device_name", None)
+        self.heterogeneous_pd = vllm_config.kv_transfer_config.get_from_extra_config("heterogeneous_pd", False)
         # get prefill tp and dp size from extra config
         prefill_parallel_config: dict[str, Any] = vllm_config.kv_transfer_config.get_from_extra_config("prefill", {})
 
-        assert "tp_size" in prefill_parallel_config
+        if "tp_size" not in prefill_parallel_config:
+            raise ValueError("MooncakeHybridConnector requires kv_connector_extra_config.prefill.tp_size.")
         self._prefill_tp_size = prefill_parallel_config["tp_size"]
 
-        assert "dp_size" in prefill_parallel_config
+        if "dp_size" not in prefill_parallel_config:
+            raise ValueError("MooncakeHybridConnector requires kv_connector_extra_config.prefill.dp_size.")
         self._prefill_dp_size = prefill_parallel_config["dp_size"]
         # get prefill pp size from extra config
         self._prefill_pp_size = prefill_parallel_config.get("pp_size", 1)
         # get decode tp and dp size from extra config
         decode_parallel_config: dict[str, Any] = vllm_config.kv_transfer_config.get_from_extra_config("decode", {})
-        assert "tp_size" in decode_parallel_config
+        if "tp_size" not in decode_parallel_config:
+            raise ValueError("MooncakeHybridConnector requires kv_connector_extra_config.decode.tp_size.")
         self._decode_tp_size = decode_parallel_config["tp_size"]
-        assert "dp_size" in decode_parallel_config
+        if "dp_size" not in decode_parallel_config:
+            raise ValueError("MooncakeHybridConnector requires kv_connector_extra_config.decode.dp_size.")
         self._decode_dp_size = decode_parallel_config["dp_size"]
         # get prefill pp size from extra config
         self._decode_pp_size = decode_parallel_config.get("pp_size", 1)
@@ -1684,6 +1841,17 @@ class MooncakeConnectorWorker:
             raise TypeError("Mooncake connector does not support this type kv_cache now.")
 
         global_te.register_buffer(ptrs, lengths)
+        kv_cache_signature = _build_kv_cache_signature(
+            self.kv_caches,
+            self.block_len_per_addr,
+            self.block_stride_per_addr,
+            self.addr_group_idx,
+            self.kv_cache_config,
+            self.use_hybrid,
+            self.use_mamba,
+            self.use_compress,
+            self.num_blocks,
+        )
         # After KV Caches registered, start the sending or receiving thread.
         metadata = MooncakeAgentMetadata(
             engine_id=self.engine_id,
@@ -1693,6 +1861,7 @@ class MooncakeConnectorWorker:
             num_blocks=self.num_blocks,
             block_lens=self.block_len_per_addr,
             ssm_sizes=self._mamba_ssm_size,
+            kv_cache_signature=kv_cache_signature,
             local_ip=get_ip(),
         )
         self.xfer_handshake_metadata = metadata
@@ -1732,6 +1901,7 @@ class MooncakeConnectorWorker:
                 self.vllm_config,
                 self.kv_cache_config,
                 self.kv_caches,
+                kv_cache_signature,
                 self._prefill_pp_layer_partition,
             )
             self.kv_recv_thread.start()
