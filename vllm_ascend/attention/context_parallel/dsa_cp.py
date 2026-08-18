@@ -768,7 +768,6 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         qli_metadata = self._build_qli_metadata(
             query_start_loc=local_query_start_loc,
             seq_lens=local_seq_lens,
-            seq_lens_q=local_seq_lens_q,
             max_seqlen=max_local_seqlen,
             max_seqlen_q=max_local_query_len,
             num_reqs=num_reqs,
@@ -990,7 +989,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         self.req_sas_metadata[:1024] = metadata
         return self.req_sas_metadata[:1024]
 
-    def _build_qli_metadata(self, query_start_loc, seq_lens, seq_lens_q, max_seqlen, max_seqlen_q, num_reqs):
+    def _build_qli_metadata(self, query_start_loc, seq_lens, max_seqlen, max_seqlen_q, num_reqs):
         if self.compressor_ratio != 4:
             return None
 
